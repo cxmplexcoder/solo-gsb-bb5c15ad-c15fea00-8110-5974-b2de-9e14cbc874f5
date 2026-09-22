@@ -1,6 +1,8 @@
 """核心业务逻辑：发布批次、拓扑分层、节点回报、失败回滚、重试断点。"""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import uuid
 from collections import defaultdict, deque
@@ -608,6 +610,137 @@ def diff_releases(release_id: str, base_release_id: str) -> dict[str, Any]:
             "impacted_nodes": len(impacted_nodes),
         },
         "compared_scope": "persisted_pruned_graph",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 批次事件审计（只读，keyset 游标分页）
+# --------------------------------------------------------------------------- #
+# 游标负载结构版本；结构变更时递增，旧结构游标一律 422
+_CURSOR_VERSION = 1
+# 单页条数上限（与批次列表接口一致）
+_EVENTS_MAX_LIMIT = 200
+
+
+def _events_fingerprint(release_id: str, event_type: str | None, node: str | None) -> str:
+    """游标绑定指纹：批次 + 过滤条件。跨批次或换过滤条件复用旧游标会 422。"""
+    raw = "\x1f".join((release_id, event_type or "", node or ""))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _encode_event_cursor(created_at: str, event_id: int, fingerprint: str) -> str:
+    payload = {
+        "v": _CURSOR_VERSION,
+        "f": fingerprint,
+        "created_at": created_at,
+        "id": event_id,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_event_cursor(cursor: str, fingerprint: str) -> tuple[str, int]:
+    """解析并校验游标，返回上一页最后一行的排序键 (created_at, id)。
+
+    无法解析、结构 / 内容非法、指纹与当前批次或过滤条件不匹配，统一 422 invalid_cursor。
+    """
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except ValueError:  # base64 / ascii / utf-8 / JSON 任一解析失败
+        raise APIError(
+            422, "invalid_cursor",
+            "游标无法解析，请使用上一页响应返回的 next_cursor",
+        ) from None
+    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+        raise APIError(
+            422, "invalid_cursor",
+            "游标结构非法，请使用上一页响应返回的 next_cursor",
+        )
+    if payload.get("f") != fingerprint:
+        raise APIError(
+            422, "invalid_cursor",
+            "游标与当前批次或过滤条件（event_type / node）不匹配，请按新条件重新从第一页查询",
+        )
+    created_at, event_id = payload.get("created_at"), payload.get("id")
+    if (not isinstance(created_at, str) or not created_at
+            or not isinstance(event_id, int) or isinstance(event_id, bool) or event_id < 1):
+        raise APIError(
+            422, "invalid_cursor",
+            "游标内容非法，请使用上一页响应返回的 next_cursor",
+        )
+    return created_at, event_id
+
+
+def list_release_events(
+    release_id: str,
+    event_type: str | None = None,
+    node: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """批次事件审计流（只读）：节点回报 / 重试 / 回滚 / 取消事件。
+
+    - 事件来自 node_events：report_success / report_failure（节点回报）、
+      retry_scheduled / retry_reset（重试）、rollback（失败回滚）、
+      cancelled / cancel_rollback（安全取消）。
+    - 按 (created_at, id) 升序稳定排序（id 自增，同时间戳以 id 决胜）。
+    - keyset 游标分页：游标记录上一页最后一行的排序键，下一页只取严格大于
+      该键的行；新事件只会追加到游标之后（id 自增、created_at 不降），
+      因此并发写入下翻页不重复、不遗漏。
+    - 游标绑定批次与过滤条件（event_type / node）指纹：跨批次或换过滤条件
+      复用游标返回 422 invalid_cursor；limit 不绑定，可逐页调整。
+    """
+    limit = min(max(limit, 1), _EVENTS_MAX_LIMIT)
+    fingerprint = _events_fingerprint(release_id, event_type, node)
+    keyset: tuple[str, int] | None = None
+    if cursor is not None:
+        keyset = _decode_event_cursor(cursor, fingerprint)
+
+    with lock():
+        conn = get_conn()
+        _get_release_row(conn, release_id)  # 批次不存在 -> 404 release_not_found
+
+        sql = [
+            "SELECT id, node_name, event_type, version, detail_json, created_at",
+            "FROM node_events WHERE release_id = ?",
+        ]
+        params: list[Any] = [release_id]
+        if event_type is not None:
+            sql.append("AND event_type = ?")
+            params.append(event_type)
+        if node is not None:
+            sql.append("AND node_name = ?")
+            params.append(node)
+        if keyset is not None:
+            sql.append("AND (created_at > ? OR (created_at = ? AND id > ?))")
+            params.extend((keyset[0], keyset[0], keyset[1]))
+        sql.append("ORDER BY created_at ASC, id ASC LIMIT ?")
+        params.append(limit + 1)  # 多取一行判断 has_more
+        rows = conn.execute(" ".join(sql), params).fetchall()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor: str | None = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = _encode_event_cursor(last["created_at"], last["id"], fingerprint)
+
+    return {
+        "release_id": release_id,
+        "items": [
+            {
+                "id": row["id"],
+                "node": row["node_name"],
+                "event_type": row["event_type"],
+                "version": row["version"],
+                "detail": json.loads(row["detail_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in page
+        ],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
     }
 
 

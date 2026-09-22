@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS node_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_release ON node_events(release_id);
+-- 事件审计接口按 (created_at, id) 稳定排序 + keyset 游标分页使用的复合索引
+CREATE INDEX IF NOT EXISTS idx_events_release_created ON node_events(release_id, created_at, id);
 """
 
 

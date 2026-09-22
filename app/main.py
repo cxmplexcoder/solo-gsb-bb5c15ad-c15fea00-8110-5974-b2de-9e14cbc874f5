@@ -23,7 +23,8 @@ app = FastAPI(
     title="依赖图发布回滚 API",
     description="客户端提交服务节点及依赖关系，按拓扑层级生成执行计划，"
                 "支持节点成功/失败回报、失败仅回滚本批次已成功节点、从断点重试、"
-                "乐观锁安全取消（pending/running 批次可取消，逆拓扑回滚已成功节点）。",
+                "乐观锁安全取消（pending/running 批次可取消，逆拓扑回滚已成功节点）、"
+                "批次事件审计流（keyset 游标分页）。",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -83,6 +84,36 @@ def diff_release(
     任一缺失批次返回 404 release_not_found；接口不改变任何批次状态。
     """
     return service.diff_releases(release_id, base_release_id)
+
+
+@app.get("/api/releases/{release_id}/events", tags=["releases"])
+def list_release_events(
+    release_id: str,
+    event_type: str | None = Query(
+        None, min_length=1,
+        description="按事件类型精确过滤（report_success / report_failure / retry_scheduled / "
+                    "retry_reset / rollback / cancelled / cancel_rollback）；不传返回全部类型",
+    ),
+    node: str | None = Query(
+        None, min_length=1, description="按节点名精确过滤",
+    ),
+    limit: int = Query(
+        50, description="每页条数（1~200，默认 50；越界自动收敛，与批次列表一致）",
+    ),
+    cursor: str | None = Query(
+        None,
+        description="上一页响应返回的 next_cursor；绑定批次与过滤条件，"
+                    "无法解析或不匹配返回 422 invalid_cursor",
+    ),
+) -> dict:
+    """查询批次事件审计流（只读，keyset 游标分页）。
+
+    复用 node_events 返回节点回报 / 重试 / 回滚 / 取消事件，按 (created_at, id)
+    升序稳定排序；支持 event_type、node 过滤与 limit。游标绑定批次与过滤条件，
+    并发写入下翻页不重复、不遗漏；非法游标返回 422 invalid_cursor。
+    响应包含 items / next_cursor / has_more；批次不存在返回 404 release_not_found。
+    """
+    return service.list_release_events(release_id, event_type, node, limit, cursor)
 
 
 @app.get("/api/releases/{release_id}/plan", tags=["releases"])
