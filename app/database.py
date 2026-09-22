@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS node_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_release ON node_events(release_id);
+-- 事件审计按 (created_at, id) 键集分页排序，避免每次查询临时排序
+CREATE INDEX IF NOT EXISTS idx_events_release_order
+    ON node_events(release_id, created_at, id);
 """
 
 

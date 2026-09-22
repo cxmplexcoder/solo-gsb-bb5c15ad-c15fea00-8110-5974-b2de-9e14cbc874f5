@@ -1080,4 +1080,244 @@ r = client.post(f"/api/releases/{ridw}/report",
 assert r.status_code == 409 and r.json()["error"]["code"] == "release_cancelled"
 print("[OK] 自动重试等待期节点随取消标 cancelled（清等待标记、留 attempt_count 历史）")
 
+# --- 28. 节点事件审计：GET /api/releases/{id}/events（游标分页）---
+# 造全类型事件：成功/失败回报、自动重试调度、失败回滚、断点重试重置、取消
+r = client.post("/api/releases", json={
+    "version": "v-events",
+    "nodes": [
+        {"name": "a"},
+        {"name": "b", "max_attempts": 2, "retry_delay_seconds": 0},
+        {"name": "c"},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+    ],
+})
+ride = r.json()["id"]
+VE = "v-events"
+assert client.post(f"/api/releases/{ride}/report",
+                   json={"node": "a", "status": "success", "version": VE}).status_code == 200
+# b 首次失败（delay=0 立即可再次回报）：report_failure + retry_scheduled
+assert client.post(f"/api/releases/{ride}/report",
+                   json={"node": "b", "status": "failed", "version": VE,
+                         "error_code": "E1"}).json()["result"] == "retry_scheduled"
+# b 第二次失败达上限：report_failure + rollback(a)
+assert client.post(f"/api/releases/{ride}/report",
+                   json={"node": "b", "status": "failed", "version": VE,
+                         "error_code": "E2"}).json()["result"] == "failed_and_rolled_back"
+# 断点重试：retry_reset(a), retry_reset(b)
+assert client.post(f"/api/releases/{ride}/retry").status_code == 200
+assert client.post(f"/api/releases/{ride}/report",
+                   json={"node": "a", "status": "success", "version": VE}).status_code == 200
+assert client.post(f"/api/releases/{ride}/report",
+                   json={"node": "b", "status": "success", "version": VE}).status_code == 200
+# 取消：c 标 cancelled（无已成功节点待回滚）
+st = client.get(f"/api/releases/{ride}").json()
+assert client.post(f"/api/releases/{ride}/cancel",
+                   json={"reason": "审计事件", "expected_revision": st["revision"]}
+                   ).status_code == 200
+
+ev = client.get(f"/api/releases/{ride}/events", params={"limit": 200}).json()
+assert ev["release_id"] == ride
+assert ev["has_more"] is False and ev["next_cursor"] is None
+seq = [(e["node"], e["event_type"]) for e in ev["items"]]
+assert seq == [
+    ("a", "report_success"),
+    ("b", "report_failure"),
+    ("b", "retry_scheduled"),
+    ("b", "report_failure"),
+    ("a", "rollback"),
+    ("a", "retry_reset"),
+    ("b", "retry_reset"),
+    ("a", "report_success"),
+    ("b", "report_success"),
+    ("c", "cancelled"),
+    ("b", "cancel_rollback"),  # 已成功节点随取消逆拓扑回滚（b 后成功先回滚）
+    ("a", "cancel_rollback"),
+], seq
+# 稳定排序：created_at 单调不减、id 严格递增；每条事件字段齐全
+ids = [e["id"] for e in ev["items"]]
+assert ids == sorted(ids) and len(set(ids)) == len(ids)
+assert [e["created_at"] for e in ev["items"]] == sorted(e["created_at"] for e in ev["items"])
+assert all(set(e) == {"id", "node", "event_type", "version", "detail", "created_at"}
+           for e in ev["items"])
+assert all(e["version"] == VE for e in ev["items"])
+det = {(e["node"], e["event_type"]): e["detail"] for e in ev["items"]}
+assert det[("b", "retry_scheduled")]["attempt_count"] == 1
+assert det[("b", "retry_scheduled")]["max_attempts"] == 2
+assert det[("a", "rollback")]["triggered_by"] == "b"
+assert det[("c", "cancelled")]["reason"] == "审计事件"
+assert det[("b", "cancel_rollback")]["reason"] == "审计事件"
+assert det[("b", "report_failure")]["error_code"] == "E2"  # 后者覆盖同键前者
+print("[OK] events：全类型事件按 (created_at, id) 稳定排序，字段与 detail 完整")
+
+# 取消回滚事件：running 批次取消已成功节点 -> cancel_rollback
+r = client.post("/api/releases", json={
+    "version": "v-events-cancel",
+    "nodes": [{"name": "s1"}, {"name": "s2"}],
+    "dependencies": [{"from_node": "s1", "to_node": "s2"}],
+})
+ridc = r.json()["id"]
+assert client.post(f"/api/releases/{ridc}/report",
+                   json={"node": "s1", "status": "success",
+                         "version": "v-events-cancel"}).status_code == 200
+st = client.get(f"/api/releases/{ridc}").json()
+assert client.post(f"/api/releases/{ridc}/cancel",
+                   json={"reason": "回滚审计", "expected_revision": st["revision"]}
+                   ).status_code == 200
+evc = client.get(f"/api/releases/{ridc}/events").json()
+assert [(e["node"], e["event_type"]) for e in evc["items"]] == [
+    ("s1", "report_success"),
+    ("s2", "cancelled"),
+    ("s1", "cancel_rollback"),
+]
+assert evc["items"][2]["detail"]["reason"] == "回滚审计"
+print("[OK] events：取消批次产生 cancelled / cancel_rollback 事件")
+
+# event_type / node 过滤（可组合）；未知类型 -> 空页
+f1 = client.get(f"/api/releases/{ride}/events",
+                params={"event_type": "report_failure"}).json()
+assert [(e["node"], e["event_type"]) for e in f1["items"]] == [
+    ("b", "report_failure"), ("b", "report_failure")]
+f2 = client.get(f"/api/releases/{ride}/events", params={"node": "b"}).json()
+assert [e["event_type"] for e in f2["items"]] == [
+    "report_failure", "retry_scheduled", "report_failure",
+    "retry_reset", "report_success", "cancel_rollback"]
+f3 = client.get(f"/api/releases/{ride}/events",
+                params={"node": "b", "event_type": "report_failure"}).json()
+assert len(f3["items"]) == 2 and all(e["node"] == "b" for e in f3["items"])
+f4 = client.get(f"/api/releases/{ride}/events", params={"event_type": "nope"}).json()
+assert f4["items"] == [] and f4["has_more"] is False and f4["next_cursor"] is None
+print("[OK] events：event_type / node 过滤与未知类型空页")
+
+
+# 游标分页翻页：与一次性全量结果完全一致（不重复、不遗漏）
+def _walk_events(rid: str, page_limit: int, **flt):
+    got, cur, pages = [], None, 0
+    while True:
+        params = {"limit": page_limit, **flt}
+        if cur is not None:
+            params["cursor"] = cur
+        body = client.get(f"/api/releases/{rid}/events", params=params).json()
+        pages += 1
+        assert len(body["items"]) <= page_limit
+        got.extend(body["items"])
+        if not body["has_more"]:
+            assert body["next_cursor"] is None
+            return got, pages
+        assert body["next_cursor"]
+        cur = body["next_cursor"]
+
+
+walked, pages = _walk_events(ride, 3)
+assert pages == 4  # 12 条 / 每页 3 -> 4 页
+assert [e["id"] for e in walked] == ids
+walked_b, _ = _walk_events(ride, 2, node="b")
+assert [e["id"] for e in walked_b] == [e["id"] for e in f2["items"]]
+walked_all, _ = _walk_events(ride, 1)
+assert [e["id"] for e in walked_all] == ids
+print("[OK] events 游标分页：多页遍历与全量一致（limit=1/2/3，含过滤条件）")
+
+# 翻页间隙并发写入：新事件出现在后续页，已读事件不重复
+r = client.post("/api/releases", json={
+    "version": "v-events-live",
+    "nodes": [{"name": "n1"}, {"name": "n2"}, {"name": "n3"}],
+    "dependencies": [{"from_node": "n1", "to_node": "n2"},
+                     {"from_node": "n2", "to_node": "n3"}],
+})
+ridl = r.json()["id"]
+VL = "v-events-live"
+for n in ("n1", "n2"):
+    assert client.post(f"/api/releases/{ridl}/report",
+                       json={"node": n, "status": "success", "version": VL}
+                       ).status_code == 200
+page1 = client.get(f"/api/releases/{ridl}/events", params={"limit": 1}).json()
+assert [e["node"] for e in page1["items"]] == ["n1"] and page1["has_more"] is True
+# 翻页间隙写入新事件（n3 成功，批次 succeeded）
+assert client.post(f"/api/releases/{ridl}/report",
+                   json={"node": "n3", "status": "success", "version": VL}).status_code == 200
+seen = list(page1["items"])
+cur = page1["next_cursor"]
+while cur:
+    body = client.get(f"/api/releases/{ridl}/events",
+                      params={"limit": 1, "cursor": cur}).json()
+    seen.extend(body["items"])
+    cur = body["next_cursor"] if body["has_more"] else None
+assert [e["node"] for e in seen] == ["n1", "n2", "n3"]
+final = client.get(f"/api/releases/{ridl}/events", params={"limit": 200}).json()
+assert [e["id"] for e in seen] == [e["id"] for e in final["items"]]
+print("[OK] events 游标分页：翻页间隙并发写入不重复、不遗漏")
+
+# 非法游标 -> 422 invalid_cursor
+import base64 as _b64  # noqa: E402
+import json as _json  # noqa: E402
+
+
+def _b64url(payload) -> str:
+    return _b64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=")
+
+
+bad_cursors = [
+    "not-a-valid-cursor!!!",
+    _b64.urlsafe_b64encode(b"hello").decode(),  # 合法 base64 但非 JSON
+    _b64url({"v": 1}),  # 缺字段
+    _b64url({"v": 2, "release_id": ride, "event_type": None, "node": None,
+             "created_at": "2026-01-01T00:00:00+00:00", "id": 1}),  # 游标版本不符
+    _b64url({"v": 1, "release_id": ride, "event_type": None, "node": None,
+             "created_at": "not-a-time", "id": 1}),  # 时间戳非法
+    _b64url({"v": 1, "release_id": ride, "event_type": None, "node": None,
+             "created_at": "2026-01-01T00:00:00+00:00", "id": "1"}),  # id 类型非法
+    _b64url({"v": 1, "release_id": ride, "event_type": None, "node": None,
+             "created_at": "2026-01-01T00:00:00+00:00", "id": 0}),  # id 越界
+    _b64url({"v": 1, "release_id": ride, "event_type": 1, "node": None,
+             "created_at": "2026-01-01T00:00:00+00:00", "id": 1}),  # event_type 类型非法
+]
+for bc in bad_cursors:
+    r = client.get(f"/api/releases/{ride}/events", params={"cursor": bc})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_cursor", (bc, r.text)
+r = client.get(f"/api/releases/{ride}/events", params={"cursor": ""})
+assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_cursor"
+print("[OK] 非法 / 损坏 / 空游标 -> 422 invalid_cursor")
+
+# 游标绑定批次与过滤条件：跨批次 / 跨过滤条件复用 -> 422
+cur_all = client.get(f"/api/releases/{ride}/events",
+                     params={"limit": 2}).json()["next_cursor"]
+r = client.get(f"/api/releases/{ridc}/events", params={"cursor": cur_all})
+assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_cursor"
+r = client.get(f"/api/releases/{ride}/events",
+               params={"cursor": cur_all, "event_type": "report_success"})
+assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_cursor"
+r = client.get(f"/api/releases/{ride}/events",
+               params={"cursor": cur_all, "node": "b"})
+assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_cursor"
+# 过滤条件下生成的游标在相同条件下可用；换条件即拒绝
+cur_b = client.get(f"/api/releases/{ride}/events",
+                   params={"node": "b", "limit": 2}).json()["next_cursor"]
+r = client.get(f"/api/releases/{ride}/events",
+               params={"node": "b", "cursor": cur_b})
+assert r.status_code == 200 and [e["event_type"] for e in r.json()["items"]] == [
+    "report_failure", "retry_reset", "report_success", "cancel_rollback"]
+r = client.get(f"/api/releases/{ride}/events", params={"cursor": cur_b})
+assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_cursor"
+r = client.get(f"/api/releases/{ride}/events",
+               params={"node": "a", "cursor": cur_b})
+assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_cursor"
+print("[OK] 游标绑定批次与过滤条件：跨批次 / 跨条件复用 -> 422 invalid_cursor")
+
+# limit / 参数校验、404 与只读语义
+assert client.get(f"/api/releases/{ride}/events", params={"limit": 0}).status_code == 422
+assert client.get(f"/api/releases/{ride}/events", params={"limit": 201}).status_code == 422
+assert client.get(f"/api/releases/{ride}/events", params={"limit": "abc"}).status_code == 422
+assert client.get(f"/api/releases/{ride}/events", params={"limit": 1}).status_code == 200
+assert client.get(f"/api/releases/{ride}/events", params={"limit": 200}).status_code == 200
+assert client.get(f"/api/releases/{ride}/events", params={"event_type": ""}).status_code == 422
+assert client.get(f"/api/releases/{ride}/events", params={"node": ""}).status_code == 422
+r = client.get("/api/releases/ghost/events")
+assert r.status_code == 404 and r.json()["error"]["code"] == "release_not_found"
+# 只读：审计查询不改变批次状态
+assert client.get(f"/api/releases/{ride}").json()["status"] == "cancelled"
+assert client.get(f"/api/releases/{ridl}").json()["status"] == "succeeded"
+print("[OK] events：limit/参数校验、404 与只读语义")
+
 print("\n全部测试通过 ✔")

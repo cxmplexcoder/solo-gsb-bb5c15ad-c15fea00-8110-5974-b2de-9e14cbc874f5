@@ -1,6 +1,7 @@
 """核心业务逻辑：发布批次、拓扑分层、节点回报、失败回滚、重试断点。"""
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 from collections import defaultdict, deque
@@ -1048,4 +1049,153 @@ def cancel_release(release_id: str, payload: CancelReleaseRequest) -> dict[str, 
             "cancelled_nodes": cancelled_nodes,
             "rolled_back_nodes": rolled_back_nodes,
             "release": view,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# 节点事件审计（键集游标分页）
+# --------------------------------------------------------------------------- #
+# node_events 只增不改：id 自增，且所有写事务经同一把锁串行提交，
+# (created_at, id) 随提交顺序单调不减。以该二元组做键集（keyset）分页，
+# 翻页期间的并发写入只会追加到游标位置之后 —— 不重复、不遗漏。
+_EVENT_CURSOR_VERSION = 1
+_EVENT_CURSOR_KEYS = frozenset(
+    {"v", "release_id", "event_type", "node", "created_at", "id"}
+)
+
+
+def _encode_event_cursor(release_id: str, event_type: str | None, node: str | None,
+                         created_at: str, event_id: int) -> str:
+    """生成不透明游标：绑定批次与过滤条件 + 页尾位置 (created_at, id)。"""
+    payload = {
+        "v": _EVENT_CURSOR_VERSION,
+        "release_id": release_id,
+        "event_type": event_type,
+        "node": node,
+        "created_at": created_at,
+        "id": event_id,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_event_cursor(cursor: str) -> dict[str, Any]:
+    """解析并严格校验游标结构；任何非法形态统一 422 invalid_cursor。"""
+    invalid = APIError(
+        422, "invalid_cursor",
+        "游标非法或已损坏：请原样回传上一页响应中的 next_cursor",
+    )
+    token = cursor.strip()
+    if not token:
+        raise invalid
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        data = json.loads(
+            base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+            .decode("utf-8")
+        )
+    except ValueError:  # 非 base64 字符 / 填充错误 / 非 UTF-8 / 非 JSON
+        raise invalid from None
+    if not isinstance(data, dict) or set(data) != _EVENT_CURSOR_KEYS:
+        raise invalid
+    if (not isinstance(data["v"], int) or isinstance(data["v"], bool)
+            or data["v"] != _EVENT_CURSOR_VERSION):
+        raise invalid
+    if not isinstance(data["release_id"], str) or not data["release_id"]:
+        raise invalid
+    if data["event_type"] is not None and not isinstance(data["event_type"], str):
+        raise invalid
+    if data["node"] is not None and not isinstance(data["node"], str):
+        raise invalid
+    if not isinstance(data["created_at"], str):
+        raise invalid
+    try:
+        datetime.fromisoformat(data["created_at"])
+    except ValueError:
+        raise invalid from None
+    if (not isinstance(data["id"], int) or isinstance(data["id"], bool)
+            or data["id"] < 1):
+        raise invalid
+    return data
+
+
+def list_release_events(
+    release_id: str,
+    event_type: str | None = None,
+    node: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """查询批次的节点事件审计流（只读，键集游标分页）。
+
+    - 事件按 (created_at, id) 升序稳定排序；node_events 只增不改、写入串行，
+      键集分页在并发写入下不重复、不遗漏（新事件只出现在游标位置之后）。
+    - 游标绑定批次与过滤条件（event_type / node）：跨批次或改变过滤条件后复用
+      游标一律 422 invalid_cursor；游标无法解析或结构非法同样 422。
+    - 响应包含 items / next_cursor / has_more；has_more=true 时把 next_cursor
+      原样作为下一次请求的 cursor 参数即可翻页。
+    """
+    with lock():
+        conn = get_conn()
+        _get_release_row(conn, release_id)  # 不存在 -> 404 release_not_found
+
+        position: tuple[str, int] | None = None
+        if cursor is not None:
+            cur = _decode_event_cursor(cursor)
+            if (cur["release_id"] != release_id
+                    or cur["event_type"] != event_type
+                    or cur["node"] != node):
+                raise APIError(
+                    422, "invalid_cursor",
+                    "游标与当前批次或过滤条件不匹配：游标仅在生成它的查询条件下有效",
+                    {"cursor_release_id": cur["release_id"],
+                     "cursor_event_type": cur["event_type"],
+                     "cursor_node": cur["node"]},
+                )
+            position = (cur["created_at"], cur["id"])
+
+        sql = [
+            "SELECT id, node_name, event_type, version, detail_json, created_at"
+            " FROM node_events WHERE release_id = ?"
+        ]
+        params: list[Any] = [release_id]
+        if event_type is not None:
+            sql.append("AND event_type = ?")
+            params.append(event_type)
+        if node is not None:
+            sql.append("AND node_name = ?")
+            params.append(node)
+        if position is not None:
+            # 键集分页：严格越过上一页最后一条的 (created_at, id)
+            sql.append("AND (created_at > ? OR (created_at = ? AND id > ?))")
+            params.extend((position[0], position[0], position[1]))
+        sql.append("ORDER BY created_at ASC, id ASC LIMIT ?")
+        params.append(limit + 1)  # 多取一条用于判定 has_more
+
+        rows = conn.execute(" ".join(sql), params).fetchall()
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        items = [
+            {
+                "id": row["id"],
+                "node": row["node_name"],
+                "event_type": row["event_type"],
+                "version": row["version"],
+                "detail": json.loads(row["detail_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in page
+        ]
+
+        next_cursor = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = _encode_event_cursor(
+                release_id, event_type, node, last["created_at"], last["id"],
+            )
+        return {
+            "release_id": release_id,
+            "items": items,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
         }

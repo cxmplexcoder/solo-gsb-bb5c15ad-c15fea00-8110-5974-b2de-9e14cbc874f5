@@ -13,6 +13,9 @@ report / retry（`409 release_cancelled`）。
 还提供只读的**批次结构差异与影响面分析**（`GET /api/releases/{id}/diff?base_release_id=...`）：
 仅比较两个批次**实际持久化的裁剪后图**，输出 added / removed / changed（字段级 reasons），
 并从新增 / 变更节点沿目标批次依赖边向下游传播得到 `impacted_nodes`。
+另有只读的**节点事件审计**（`GET /api/releases/{id}/events`）：复用 `node_events` 审计表，
+按 `(created_at, id)` 稳定排序返回节点回报 / 重试 / 回滚 / 取消事件，支持 `event_type` / `node`
+过滤与**绑定批次和过滤条件的游标分页**（并发写入下不重复不遗漏，非法游标返回 422）。
 
 ## 一条命令启动
 
@@ -213,6 +216,28 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 旧版 SQLite 文件启动时幂等迁移：`releases` 自动补 `revision`（旧批次统一为 1）、
   `cancel_reason`、`cancelled_at` 列，旧批次行为与升级前一致。
 
+**节点事件审计（游标分页）**
+
+`GET /api/releases/{id}/events` 复用 `node_events` 审计表，按时间线返回批次的全部节点事件：
+节点回报（`report_success` / `report_failure`）、自动重试调度（`retry_scheduled`）、
+失败回滚（`rollback`）、断点重试重置（`retry_reset`）、安全取消（`cancelled`）
+与取消回滚（`cancel_rollback`）。
+
+- 事件按 `(created_at, id)` **升序稳定排序**（同一事务内的事件时间戳相同，按自增 `id` 决胜）；
+  每条事件含 `id` / `node` / `event_type` / `version` / `detail` / `created_at`。
+- 查询参数：`event_type`（精确匹配）、`node`（节点名精确匹配）、`limit`（每页 1~200，默认 50）、
+  `cursor`（上一页响应的 `next_cursor`，原样回传）。
+- 响应固定包含 `items` / `next_cursor` / `has_more`：`has_more=true` 时携带 `next_cursor`，
+  作为下一次请求的 `cursor` 参数即可翻页；`has_more=false` 时 `next_cursor` 为 `null`。
+- **游标绑定批次与过滤条件**：游标内部记录 `release_id` 与生成时的 `event_type` / `node`，
+  跨批次或改变过滤条件后复用游标返回 **`422 invalid_cursor`**；游标无法解析、结构非法
+  （缺字段 / 类型错误 / 非法时间戳）或为空串同样返回 `422 invalid_cursor`。
+- **并发写入不重复、不遗漏**：`node_events` 只增不改，`id` 自增且所有写事务经同一把锁串行提交，
+  键集（keyset）分页以 `(created_at, id)` 严格大于游标位置取下一页——翻页间隙新写入的事件
+  只会出现在后续页中，已读事件不会重复；不使用 OFFSET，页深增加性能不退化。
+- 接口为**只读**：不改变任何批次 / 节点状态；批次不存在返回 `404 release_not_found`；
+  `limit` 越界（非 1~200 整数）或 `event_type` / `node` 为空串返回 `422`（请求参数校验）。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -225,6 +250,7 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409；自动重试等待期返回 409 retry_not_due；未达上限返回 retry_scheduled，达上限失败回滚；已取消批次返回 409 release_cancelled） |
 | `POST` | `/api/releases/{id}/retry` | 从断点续发（已取消批次返回 409 release_cancelled） |
 | `POST` | `/api/releases/{id}/cancel` | 安全取消 pending/running 批次（body：`reason` + `expected_revision`；同一事务校验修订号，过期 409 state_conflict 且状态不变；未执行节点标 cancelled、已成功节点逆拓扑回滚，返回 cancelled_nodes / rolled_back_nodes / 新 revision；终态批次 409 cancel_not_allowed） |
+| `GET` | `/api/releases/{id}/events?event_type=&node=&limit=&cursor=` | 节点事件审计流（只读；回报 / 重试 / 回滚 / 取消事件按 created_at+id 稳定排序；event_type / node 过滤，limit 1~200 默认 50；游标绑定批次与过滤条件，并发写入不重复不遗漏，非法或跨条件游标 422 invalid_cursor；响应 items / next_cursor / has_more） |
 | `GET` | `/health` | 健康检查 |
 
 错误响应统一格式：`{"error": {"code": "...", "message": "...", ...}}`。
@@ -446,6 +472,34 @@ curl -s http://localhost:8000/api/releases/<ID>
 #     "cancelled_at":"...", "nodes":[...cancelled / rolled_back...]}
 ```
 
+事件审计示例（游标分页遍历事件时间线）：
+
+```bash
+# 1) 第一页：默认每页 50 条，按 (created_at, id) 升序
+curl -s 'http://localhost:8000/api/releases/<ID>/events?limit=2'
+# -> {
+#   "release_id": "<ID>",
+#   "items": [
+#     {"id": 1, "node": "svc-a", "event_type": "report_success",
+#      "version": "2026.09.20-001", "detail": {}, "created_at": "..."},
+#     {"id": 2, "node": "svc-b", "event_type": "report_success",
+#      "version": "2026.09.20-001", "detail": {}, "created_at": "..."}
+#   ],
+#   "next_cursor": "eyJ2IjoxLCJyZWxlYXNlX2lkIjoi...",
+#   "has_more": true
+# }
+
+# 2) 下一页：原样回传 next_cursor（过滤条件必须与生成游标时一致）
+curl -s 'http://localhost:8000/api/releases/<ID>/events?limit=2&cursor=<NEXT_CURSOR>'
+
+# 3) 过滤：只看 svc-b 的失败与回滚类事件
+curl -s 'http://localhost:8000/api/releases/<ID>/events?node=svc-b&event_type=rollback'
+
+# 4) 非法 / 跨批次 / 跨过滤条件复用游标 -> 422
+#    {"error":{"code":"invalid_cursor","message":"游标非法或已损坏：..."}}
+#    {"error":{"code":"invalid_cursor","message":"游标与当前批次或过滤条件不匹配：...", ...}}
+```
+
 循环依赖示例（返回 `422`）：
 
 ```bash
@@ -465,7 +519,7 @@ curl -i -X POST http://localhost:8000/api/releases \
 │   ├── database.py    # SQLite 连接、建表、事务
 │   ├── models.py      # 请求模型
 │   ├── errors.py      # 业务异常
-│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试 / 安全取消 / 批次差异与影响面
+│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试 / 安全取消 / 批次差异与影响面 / 事件审计
 ├── requirements.txt
 ├── smoke_test.py      # 端到端冒烟测试（pip install httpx 后 python3 smoke_test.py）
 ├── Dockerfile         # 构建期安装依赖
@@ -499,4 +553,7 @@ impacted_nodes 沿目标批次依赖边向下游传递含起点、removed 不参
 state_conflict 携带两侧修订号且状态不变、已取消批次重复取消 409 release_cancelled、
 succeeded/failed 取消 409 cancel_not_allowed、取消后 report/retry 409 release_cancelled 且状态不变、
 取消与取消/取消与失败回报并发恰一个状态迁移成功且 revision 恰好 +1、自动重试等待期节点随取消标
-cancelled 并清等待标记保留尝试历史、旧库补列 revision/cancel_reason/cancelled_at 且旧批次可取消）。
+cancelled 并清等待标记保留尝试历史、旧库补列 revision/cancel_reason/cancelled_at 且旧批次可取消）、
+节点事件审计（全类型事件按 created_at+id 稳定排序、event_type/node 过滤与组合、未知类型空页、
+limit 1~200 校验、游标分页多页遍历与全量一致、翻页间隙并发写入不重复不遗漏、
+游标绑定批次与过滤条件跨用 422、非法/损坏/空游标 422 invalid_cursor、批次 404、只读不改状态）。

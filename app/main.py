@@ -102,6 +102,35 @@ def get_release_plan(
     return service.get_release_plan(release_id, deadline_seconds)
 
 
+@app.get("/api/releases/{release_id}/events", tags=["releases"])
+def list_release_events(
+    release_id: str,
+    event_type: str | None = Query(
+        None, min_length=1,
+        description="按事件类型精确过滤：report_success / report_failure / retry_scheduled / "
+                    "rollback / retry_reset / cancelled / cancel_rollback",
+    ),
+    node: str | None = Query(None, min_length=1, description="按节点名精确过滤"),
+    limit: int = Query(50, ge=1, le=200, description="每页条数（1~200，默认 50）"),
+    cursor: str | None = Query(
+        None,
+        description="分页游标：原样回传上一页响应的 next_cursor；"
+                    "无法解析或与当前批次 / 过滤条件不匹配返回 422 invalid_cursor",
+    ),
+) -> dict:
+    """查询批次节点事件审计流（只读，键集游标分页）。
+
+    复用 node_events 审计表，按 (created_at, id) 升序稳定返回节点回报（成功 / 失败）、
+    自动重试调度、失败回滚、断点重试重置与安全取消（含取消回滚）事件。
+    游标绑定批次与 event_type / node 过滤条件：并发写入下翻页不重复、不遗漏；
+    游标无法解析、结构非法或跨批次 / 跨过滤条件复用均返回 422 invalid_cursor。
+    响应包含 items / next_cursor / has_more；批次不存在返回 404 release_not_found。
+    """
+    return service.list_release_events(
+        release_id, event_type=event_type, node=node, limit=limit, cursor=cursor,
+    )
+
+
 @app.post("/api/releases/{release_id}/report", tags=["releases"])
 def report_node(release_id: str, payload: ReportRequest) -> dict:
     """回报节点执行结果。
